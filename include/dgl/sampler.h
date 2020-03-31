@@ -39,6 +39,14 @@ class SamplerOp {
                                  int num_hops, int expand_factor,
                                  const bool add_self_loop,
                                  const ValueType *probability);
+template<typename ValueType>
+  static NodeFlow ChunkSample(const ImmutableGraph *graph,
+                                 const std::vector<dgl_id_t>& seeds,
+                                 const std::string &edge_type,
+                                 int num_hops, int expand_factor,
+                                 const bool add_self_loop,
+                                 const ValueType *probability,
+                                 const IdArray chunk_nodes);
 
   /*!
    * \brief Sample a graph from the seed vertices with layer sampling.
@@ -54,8 +62,10 @@ class SamplerOp {
                                      const std::vector<dgl_id_t>& seeds,
                                      const std::string &neigh_type,
                                      IdArray layer_sizes);
+    
 };
 
 }  // namespace dgl
 
 #endif  // DGL_SAMPLER_H_
+

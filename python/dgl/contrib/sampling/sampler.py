@@ -20,7 +20,7 @@ try:
 except ImportError:
     import queue
 
-__all__ = ['NeighborSampler', 'LayerSampler', 'EdgeSampler']
+__all__ = ['NeighborSampler', 'LayerSampler', 'EdgeSampler','ChunkSampler']
 
 class SamplerIter(object):
     def __init__(self, sampler):
@@ -804,4 +804,64 @@ def create_full_nodeflow(g, num_layers, add_self_loop=False):
         num_layers, add_self_loop=add_self_loop)
     return next(iter(sampler))
 
+class ChunkSampler(NodeFlowSampler):
+
+    immutable_only = True
+
+    def __init__(
+            self,
+            g,
+            batch_size,
+            expand_factor=None,
+            num_hops=1,
+            neighbor_type='in',
+            transition_prob=None,
+            seed_nodes=None,
+            shuffle=False,
+            num_workers=1,
+            prefetch=False,
+            add_self_loop=False,
+            chunk_nodes=None):
+        super(ChunkSampler, self).__init__(
+                g, batch_size, seed_nodes, shuffle, num_workers * 2 if prefetch else 0,
+                ThreadPrefetchingWrapper)
+
+        assert g.is_readonly, "NeighborSampler doesn't support mutable graphs. " + \
+                "Please turn it into an immutable graph with DGLGraph.readonly"
+        assert isinstance(expand_factor, Integral), 'non-int expand_factor not supported'
+
+        self._expand_factor = int(expand_factor)
+        self._num_hops = int(num_hops)
+        self._add_self_loop = add_self_loop
+        self._num_workers = int(num_workers)
+        self._neighbor_type = neighbor_type
+        self._transition_prob = transition_prob
+        self._chunk_nodes = utils.toindex(chunk_nodes)
+
+    def fetch(self, current_nodeflow_index):
+        if self._transition_prob is None:
+            prob = F.tensor([], F.float32)
+        elif isinstance(self._transition_prob, str):
+            prob = self.g.edata[self._transition_prob]
+        else:
+            prob = self._transition_prob
+
+        nfobjs = _CAPI_ChunkSampling(
+            self.g._graph,
+            self.seed_nodes.todgltensor(),
+            current_nodeflow_index, # start batch id
+            self.batch_size,        # batch size
+            self._num_workers,      # num batches
+            self._expand_factor,
+            self._num_hops,
+            self._neighbor_type,
+            self._add_self_loop,
+            F.zerocopy_to_dgl_ndarray(prob),
+            self._chunk_nodes.todgltensor()
+            )
+
+        nflows = [NodeFlow(self.g, obj) for obj in nfobjs]
+        return nflows
+
 _init_api('dgl.sampling', __name__)
+

@@ -325,7 +325,82 @@ void GetNonUniformSample(const ValueType* probability,
   sort(out_ver->begin(), out_ver->end());
   sort(out_edge->begin(), out_edge->end());
 }
+/*-----------------------------------------------------------------------------------*/
+/* Chunk based uniform sample*/
+void ChunkGetUniformSample(const dgl_id_t* edge_id_list,
+                      const dgl_id_t* vid_list,
+                      const size_t ver_len,
+                      const size_t max_num_neighbor,
+                      std::vector<dgl_id_t>* out_ver,
+                      std::vector<dgl_id_t>* out_edge,
+                      const IdArray chunk_nodes) {
+  // select required nodes
+  std::vector<dgl_id_t>  idx2id;// idx指向的vid_list或者edge_id_list的下标
+  size_t new_ver_len=0;
+  const dgl_id_t* chunk_nodes_data =static_cast<dgl_id_t*>(chunk_nodes->data);
+  const int64_t chunk_nodes_num = chunk_nodes->shape[0];
+  int i=0, j=0;//point to neigbors / chunk nodes
+  // check whether it is sorted.
+ /* for (int k=0;k < ver_len;k++){
+    if(k>=1){
+        CHECK_GT(vid_list[k], vid_list[k-1]);
+      }
+  }
+  for(int t=0; t < chunk_nodes_num;t++){ //find and set true
+    if(t>=1){
+      CHECK_GT(chunk_nodes_data[t], chunk_nodes_data[t-1]);
+    }
+  }*/
+  // NOTE: This method requires both two lists are sorted incresingly.
+  while(i < ver_len && j < chunk_nodes_num){
+    int neibor_v = vid_list[i];
+    int chunk_v = chunk_nodes_data[j];
+    if( neibor_v < chunk_v ){
+      i++;
+    }
+    else if( neibor_v > chunk_v ){
+      j++;
+    }
+    else{
+      idx2id.emplace_back(i);
+      new_ver_len++;
+      i++;
+      j++;
+    }
+  }
+  // Copy vid_list to output
+  if (new_ver_len <= max_num_neighbor) {
+    for(int i=0; i < new_ver_len; i++){
+        out_ver->emplace_back(vid_list[idx2id[i]]);
+        out_edge->emplace_back(edge_id_list[idx2id[i]]);
+    }
+    return;
+  }
+  // If we just sample a small number of elements from a large neighbor list.
+  std::vector<size_t> sorted_idxs;
+  if (new_ver_len > max_num_neighbor * 2) {
+    sorted_idxs.reserve(max_num_neighbor);
+    RandomSample(new_ver_len, max_num_neighbor, &sorted_idxs);
+    std::sort(sorted_idxs.begin(), sorted_idxs.end());
+  } else {
+    std::vector<size_t> negate;
+    negate.reserve(new_ver_len - max_num_neighbor);
+    RandomSample(new_ver_len, new_ver_len - max_num_neighbor, &negate);
+    std::sort(negate.begin(), negate.end());
+    NegateArray(negate, new_ver_len, &sorted_idxs);
+  }
+  // verify the result.
+  CHECK_EQ(sorted_idxs.size(), max_num_neighbor);
+  for (size_t i = 1; i < sorted_idxs.size(); i++) {
+    CHECK_GT(sorted_idxs[i], sorted_idxs[i - 1]);
+  }
+  for (auto idx : sorted_idxs) {
+    out_ver->push_back(vid_list[idx2id[idx]]);
+    out_edge->push_back(edge_id_list[idx2id[idx]]);
+  }
+}
 
+/*-----------------------------------------------------------------------------------*/
 /*
  * Used for subgraph sampling
  */
@@ -355,7 +430,7 @@ NodeFlow ConstructNodeFlow(std::vector<dgl_id_t> neighbor_list,
                            std::vector<std::pair<dgl_id_t, int> > *sub_vers,
                            std::vector<neighbor_info> *neigh_pos,
                            const std::string &edge_type,
-                           int64_t num_edges, int num_hops) {
+                           int64_t num_edges, int num_hops, bool is_multigraph) {
   NodeFlow nf = NodeFlow::Create();
   uint64_t num_vertices = sub_vers->size();
   nf->node_mapping = aten::NewIdArray(num_vertices);
@@ -368,8 +443,9 @@ NodeFlow ConstructNodeFlow(std::vector<dgl_id_t> neighbor_list,
   dgl_id_t *flow_off_data = static_cast<dgl_id_t *>(nf->flow_offsets->data);
   dgl_id_t *edge_map_data = static_cast<dgl_id_t *>(nf->edge_mapping->data);
 
-  // Construct sub_csr_graph, we treat nodeflow as multigraph by default
-  auto subg_csr = CSRPtr(new CSR(num_vertices, num_edges));
+  // Construct sub_csr_graph
+  // TODO(minjie): is nodeflow a multigraph?
+  auto subg_csr = CSRPtr(new CSR(num_vertices, num_edges, is_multigraph));
   dgl_id_t* indptr_out = static_cast<dgl_id_t*>(subg_csr->indptr()->data);
   dgl_id_t* col_list_out = static_cast<dgl_id_t*>(subg_csr->indices()->data);
   dgl_id_t* eid_out = static_cast<dgl_id_t*>(subg_csr->edge_ids()->data);
@@ -591,9 +667,127 @@ NodeFlow SampleSubgraph(const ImmutableGraph *graph,
   }
 
   return ConstructNodeFlow(neighbor_list, edge_list, layer_offsets, &sub_vers, &neigh_pos,
-                           edge_type, num_edges, num_hops);
+                           edge_type, num_edges, num_hops, graph->IsMultigraph());
 }
+/*-------------------------------------------------------*/
+template<typename ValueType>
+NodeFlow ChunkSampleSubgraph(const ImmutableGraph *graph, //整个大图
+                        const std::vector<dgl_id_t>& seeds,//经过worker分发后的seed
+                        const ValueType* probability,
+                        const std::string &edge_type,
+                        int num_hops,
+                        size_t num_neighbor,
+                        const bool add_self_loop,
+                        const IdArray chunk_nodes) {
+  CHECK_EQ(graph->NumBits(), 64) << "32 bit graph is not supported yet";
+  const size_t num_seeds = seeds.size();
+  auto orig_csr = edge_type == "in" ? graph->GetInCSR() : graph->GetOutCSR();
+  orig_csr->SortCSR();
+  const dgl_id_t* val_list = static_cast<dgl_id_t*>(orig_csr->edge_ids()->data);
+  const dgl_id_t* col_list = static_cast<dgl_id_t*>(orig_csr->indices()->data);
+  const dgl_id_t* indptr = static_cast<dgl_id_t*>(orig_csr->indptr()->data);
 
+  std::unordered_set<dgl_id_t> sub_ver_map;  // The vertex Ids in a layer.每层已经被采样的点，避免重复采样
+  std::vector<std::pair<dgl_id_t, int> > sub_vers;
+  sub_vers.reserve(num_seeds * 10);
+  // add seed vertices
+  for (size_t i = 0; i < num_seeds; ++i) {
+    auto ret = sub_ver_map.insert(seeds[i]);
+    // If the vertex is inserted successfully.
+    if (ret.second) {
+      sub_vers.emplace_back(seeds[i], 0);//应该是sub_vers记录每个点以及所在的层数
+    }
+  }
+  std::vector<dgl_id_t> tmp_sampled_src_list;
+  std::vector<dgl_id_t> tmp_sampled_edge_list;
+  // ver_id, position
+  std::vector<neighbor_info> neigh_pos;
+  neigh_pos.reserve(num_seeds);
+  std::vector<dgl_id_t> neighbor_list;
+  std::vector<dgl_id_t> edge_list;
+  std::vector<size_t> layer_offsets(num_hops + 1);
+  int64_t num_edges = 0;
+
+  layer_offsets[0] = 0;
+  layer_offsets[1] = sub_vers.size();
+  for (int layer_id = 1; layer_id < num_hops; layer_id++) {
+    // We need to avoid resampling the same node in a layer, but we allow a node
+    // to be resampled in multiple layers. We use `sub_ver_map` to keep track of
+    // sampled nodes in a layer, and clear it when entering a new layer.
+    sub_ver_map.clear();
+    // Previous iteration collects all nodes in sub_vers, which are collected
+    // in the previous layer. sub_vers is used both as a node collection and a queue.
+    for (size_t idx = layer_offsets[layer_id - 1]; idx < layer_offsets[layer_id]; idx++) {
+      dgl_id_t dst_id = sub_vers[idx].first;//当前层第一个节点
+      const int cur_node_level = sub_vers[idx].second;//当前在第几层
+
+      tmp_sampled_src_list.clear();
+      tmp_sampled_edge_list.clear();
+      dgl_id_t ver_len = *(indptr+dst_id+1) - *(indptr+dst_id);
+      if (probability == nullptr) {  // uniform-sample
+        ChunkGetUniformSample(val_list + *(indptr + dst_id),
+                         col_list + *(indptr + dst_id),
+                         ver_len,//邻居个数
+                         num_neighbor,//采样邻居个数
+                         &tmp_sampled_src_list,
+                         &tmp_sampled_edge_list,
+                         chunk_nodes
+                         );
+      } else {  // non-uniform-sample // TODO:暂未实现
+        GetNonUniformSample(probability,
+                            val_list + *(indptr + dst_id),
+                            col_list + *(indptr + dst_id),
+                            ver_len,
+                            num_neighbor,
+                            &tmp_sampled_src_list,
+                            &tmp_sampled_edge_list
+                            );
+      }
+      // If we need to add self loop and it doesn't exist in the sampled neighbor list.
+      if (add_self_loop && std::find(tmp_sampled_src_list.begin(), tmp_sampled_src_list.end(),
+                                     dst_id) == tmp_sampled_src_list.end()) {
+        tmp_sampled_src_list.push_back(dst_id);
+        const dgl_id_t *src_list = col_list + *(indptr + dst_id);
+        const dgl_id_t *eid_list = val_list + *(indptr + dst_id);
+        // TODO(zhengda) this operation has O(N) complexity. It can be pretty slow.
+        const dgl_id_t *src = std::find(src_list, src_list + ver_len, dst_id);
+        // If there doesn't exist a self loop in the graph.
+        // we have to add -1 as the edge id for the self-loop edge.
+        if (src == src_list + ver_len)
+          tmp_sampled_edge_list.push_back(-1);
+        else
+          tmp_sampled_edge_list.push_back(eid_list[src - src_list]);
+      }
+      CHECK_EQ(tmp_sampled_src_list.size(), tmp_sampled_edge_list.size());
+      neigh_pos.emplace_back(dst_id, neighbor_list.size(), tmp_sampled_src_list.size());
+      // Then push the vertices
+      for (size_t i = 0; i < tmp_sampled_src_list.size(); ++i) {
+        neighbor_list.push_back(tmp_sampled_src_list[i]);
+      }
+      // Finally we push the edge list
+      for (size_t i = 0; i < tmp_sampled_edge_list.size(); ++i) {
+        edge_list.push_back(tmp_sampled_edge_list[i]);
+      }
+      num_edges += tmp_sampled_src_list.size();
+      for (size_t i = 0; i < tmp_sampled_src_list.size(); ++i) {
+        // We need to add the neighbor in the hashtable here. This ensures that
+        // the vertex in the queue is unique. If we see a vertex before, we don't
+        // need to add it to the queue again.
+        auto ret = sub_ver_map.insert(tmp_sampled_src_list[i]);
+        // If the sampled neighbor is inserted to the map successfully.
+        if (ret.second) {
+          sub_vers.emplace_back(tmp_sampled_src_list[i], cur_node_level + 1);
+        }
+      }
+    }
+    layer_offsets[layer_id + 1] = layer_offsets[layer_id] + sub_ver_map.size();
+    CHECK_EQ(layer_offsets[layer_id + 1], sub_vers.size());
+  }
+
+return ConstructNodeFlow(neighbor_list, edge_list, layer_offsets, &sub_vers, &neigh_pos,
+                           edge_type, num_edges, num_hops, graph->IsMultigraph());
+}
+/*-------------------------------------------------------*/
 }  // namespace
 
 DGL_REGISTER_GLOBAL("nodeflow._CAPI_NodeFlowGetGraph")
@@ -641,7 +835,26 @@ NodeFlow SamplerOp::NeighborSample(const ImmutableGraph *graph,
                         expand_factor,
                         add_self_loop);
 }
-
+/*----------------------------------------------------------*/
+template<typename ValueType>
+NodeFlow SamplerOp::ChunkSample(const ImmutableGraph *graph,
+                                   const std::vector<dgl_id_t>& seeds,
+                                   const std::string &edge_type,
+                                   int num_hops, int expand_factor,
+                                   const bool add_self_loop,
+                                   const ValueType *probability,
+                                   const IdArray chunk_nodes
+                                   ) {
+  return ChunkSampleSubgraph(graph,
+                        seeds,
+                        probability,
+                        edge_type,
+                        num_hops + 1,
+                        expand_factor,
+                        add_self_loop,
+                        chunk_nodes);
+}
+/*---------------------------------------------------------*/
 namespace {
   void ConstructLayers(const dgl_id_t *indptr,
                        const dgl_id_t *indices,
@@ -865,6 +1078,46 @@ std::vector<NodeFlow> NeighborSamplingImpl(const ImmutableGraphPtr gptr,
     }
     return nflows;
 }
+/*--------------------------------------------------------------------*/
+template<typename ValueType>
+std::vector<NodeFlow> ChunkSamplingImpl(const ImmutableGraphPtr gptr,
+                                           const IdArray seed_nodes,
+                                           const int64_t batch_start_id,
+                                           const int64_t batch_size,
+                                           const int64_t max_num_workers,
+                                           const int64_t expand_factor,
+                                           const int64_t num_hops,
+                                           const std::string neigh_type,
+                                           const bool add_self_loop,
+                                           const ValueType *probability,
+                                           const IdArray chunk_nodes
+                                           ) {
+    // process args
+    CHECK(aten::IsValidIdArray(seed_nodes));
+    const dgl_id_t* seed_nodes_data = static_cast<dgl_id_t*>(seed_nodes->data);
+    const int64_t num_seeds = seed_nodes->shape[0];
+    const int64_t num_workers = std::min(max_num_workers,
+        (num_seeds + batch_size - 1) / batch_size - batch_start_id);
+    // We need to make sure we have the right CSR before we enter parallel sampling.
+    BuildCsr(*gptr, neigh_type);
+    // generate node flows
+    std::vector<NodeFlow> nflows(num_workers);
+#pragma omp parallel for
+    for (int i = 0; i < num_workers; i++) {
+      // create per-worker seed nodes.
+      const int64_t start = (batch_start_id + i) * batch_size;
+      const int64_t end = std::min(start + batch_size, num_seeds);
+      // TODO(minjie): the vector allocation/copy is unnecessary
+      std::vector<dgl_id_t> worker_seeds(end - start);
+      std::copy(seed_nodes_data + start, seed_nodes_data + end,
+                worker_seeds.begin());
+      nflows[i] = SamplerOp::ChunkSample(
+          gptr.get(), worker_seeds, neigh_type, num_hops, expand_factor,
+          add_self_loop, probability,chunk_nodes);
+    }
+    return nflows;
+}
+/*--------------------------------------------------------------------*/
 
 DGL_REGISTER_GLOBAL("sampling._CAPI_UniformSampling")
 .set_body([] (DGLArgs args, DGLRetValue* rv) {
@@ -991,7 +1244,63 @@ DGL_REGISTER_GLOBAL("sampling._CAPI_LayerSampling")
     }
     *rv = List<NodeFlow>(nflows);
   });
+/*--------------------------------------------------------------------*/
+DGL_REGISTER_GLOBAL("sampling._CAPI_ChunkSampling")
+.set_body([] (DGLArgs args, DGLRetValue* rv) {
+    // arguments
+    const GraphRef g = args[0];
+    const IdArray seed_nodes = args[1];
+    const int64_t batch_start_id = args[2];
+    const int64_t batch_size = args[3];
+    const int64_t max_num_workers = args[4];
+    const int64_t expand_factor = args[5];
+    const int64_t num_hops = args[6];
+    const std::string neigh_type = args[7];
+    const bool add_self_loop = args[8];
+    const NDArray probability = args[9];
+    const IdArray chunk_nodes = args[10];//增加除最后一层外可选的nodes范围
 
+    auto gptr = std::dynamic_pointer_cast<ImmutableGraph>(g.sptr());
+    CHECK(gptr) << "sampling isn't implemented in mutable graph";
+
+    CHECK(aten::IsValidIdArray(seed_nodes));
+    CHECK_EQ(seed_nodes->ctx.device_type, kDLCPU)
+      << "NeighborSampler only support CPU sampling";
+
+    std::vector<NodeFlow> nflows;
+
+    CHECK(probability->dtype.code == kDLFloat)
+      << "transition probability must be float";
+    CHECK(probability->ndim == 1)
+      << "transition probability must be a 1-dimensional vector";
+    CHECK_EQ(probability->ctx.device_type, kDLCPU)
+      << "NeighborSampling only support CPU sampling";
+
+    ATEN_FLOAT_TYPE_SWITCH(
+      probability->dtype,
+      FloatType,
+      "transition probability",
+      {
+        const FloatType *prob;
+
+        if (probability->ndim == 1 && probability->shape[0] == 0) {
+          prob = nullptr;
+        } else {
+          CHECK(probability->shape[0] == gptr->NumEdges())
+            << "transition probability must have same number of elements as edges";
+          CHECK(probability.IsContiguous())
+            << "transition probability must be contiguous tensor";
+          prob = static_cast<const FloatType *>(probability->data);
+        }
+
+        nflows = ChunkSamplingImpl(
+            gptr, seed_nodes, batch_start_id, batch_size, max_num_workers,
+            expand_factor, num_hops, neigh_type, add_self_loop, prob, chunk_nodes);
+    });
+
+    *rv = List<NodeFlow>(nflows);
+  });
+/*--------------------------------------------------------------------*/
 namespace {
 
 void BuildCoo(const ImmutableGraph &g) {
@@ -1089,6 +1398,7 @@ NegSubgraph EdgeSamplerObject::genNegEdgeSubgraph(const Subgraph &pos_subg,
   int64_t num_tot_nodes = gptr_->NumVertices();
   if (neg_sample_size > num_tot_nodes)
     neg_sample_size = num_tot_nodes;
+  bool is_multigraph = gptr_->IsMultigraph();
   std::vector<IdArray> adj = pos_subg.graph->GetAdj(false, "coo");
   IdArray coo = adj[0];
   int64_t num_pos_edges = coo->shape[0] / 2;
@@ -1221,7 +1531,7 @@ NegSubgraph EdgeSamplerObject::genNegEdgeSubgraph(const Subgraph &pos_subg,
   NegSubgraph neg_subg;
   // We sample negative vertices without replacement.
   // There shouldn't be duplicated edges.
-  COOPtr neg_coo(new COO(num_neg_nodes, neg_src, neg_dst));
+  COOPtr neg_coo(new COO(num_neg_nodes, neg_src, neg_dst, is_multigraph));
   neg_subg.graph = GraphPtr(new ImmutableGraph(neg_coo));
   neg_subg.induced_vertices = induced_neg_vid;
   neg_subg.induced_edges = induced_neg_eid;
@@ -1372,7 +1682,7 @@ NegSubgraph EdgeSamplerObject::genChunkedNegEdgeSubgraph(const Subgraph &pos_sub
   NegSubgraph neg_subg;
   // We sample negative vertices without replacement.
   // There shouldn't be duplicated edges.
-  COOPtr neg_coo(new COO(num_neg_nodes, neg_src, neg_dst));
+  COOPtr neg_coo(new COO(num_neg_nodes, neg_src, neg_dst, gptr_->IsMultigraph()));
   neg_subg.graph = GraphPtr(new ImmutableGraph(neg_coo));
   neg_subg.induced_vertices = induced_neg_vid;
   neg_subg.induced_edges = induced_neg_eid;
@@ -1928,3 +2238,4 @@ DGL_REGISTER_GLOBAL("sampling._CAPI_ResetWeightedEdgeSample")
 });
 
 }  // namespace dgl
+
